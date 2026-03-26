@@ -1,0 +1,539 @@
+import streamlit as st
+from snowflake.snowpark.context import get_active_session
+import json
+import re
+
+st.set_page_config(page_title="Customer Churn Intelligence", layout="wide")
+
+session = get_active_session()
+
+PREDICTIONS_TABLE = "NICE_CALLCENTER_DB.AI_READY.CUSTOMER_CHURN_PREDICTIONS"
+DENORM_TABLE = "NICE_CALLCENTER_DB.AI_READY.CUSTOMER_INTERACTIONS_DENORM"
+MODEL = "NICE_CALLCENTER_DB.FEATURE_STORE.CUSTOMER_CHURN_MODEL"
+TRAINING_TABLE = "NICE_CALLCENTER_DB.FEATURE_STORE.CHURN_TRAINING_DATA"
+
+SYSTEM_PROMPT = r"""You are a customer churn analytics assistant. Given a user question, generate a Snowflake SQL query.
+
+TABLES:
+1. NICE_CALLCENTER_DB.AI_READY.CUSTOMER_CHURN_PREDICTIONS
+   - CUSTOMER_ID, FIRST_NAME, LAST_NAME, COMPANY_NAME, EMAIL, ACCOUNT_TYPE, CONTRACT_TIER
+   - INTERACTION_COUNT, AVG_DURATION_SEC, AVG_HANDLE_TIME_SEC, AVG_SENTIMENT, AVG_CSAT, AVG_NPS, AVG_CES, FCR_RATE
+   - TRANSFER_COUNT, ESCALATION_COUNT
+   - CHURN_PREDICTION (0=Retained, 1=Churned), CHURN_PROBABILITY (0-1 float), CHURN_RISK_LEVEL (HIGH/MEDIUM/LOW)
+   - INFERENCE_TIMESTAMP
+
+2. NICE_CALLCENTER_DB.AI_READY.CUSTOMER_INTERACTIONS_DENORM
+   - Same customer & interaction columns plus ACCOUNT_TYPE_RANK, CONTRACT_TIER_RANK, AVG_WRAP_UP_SEC
+
+3. ML MODEL: NICE_CALLCENTER_DB.FEATURE_STORE.CUSTOMER_CHURN_MODEL
+   - !PREDICT(INTERACTION_COUNT, AVG_DURATION_SEC, AVG_WRAP_UP_SEC, AVG_HANDLE_TIME_SEC, TRANSFER_COUNT, ESCALATION_COUNT, AVG_SENTIMENT, AVG_CSAT, AVG_NPS, AVG_CES, FCR_RATE, ACCOUNT_TYPE_RANK, CONTRACT_TIER_RANK):output_feature_0::INT -> 0 or 1
+   - !PREDICT_PROBA(...same 13 args...):output_feature_1::FLOAT -> churn probability
+
+RULES:
+- Use fully qualified table names
+- For churn lookups: first check CUSTOMER_CHURN_PREDICTIONS
+- For on-the-fly inference on customers NOT in predictions table, join CUSTOMER_INTERACTIONS_DENORM with the ML model functions, filling NULLs: COALESCE(AVG_CSAT, 3.0), COALESCE(AVG_NPS, 5.0), COALESCE(AVG_CES, 3.0)
+- Return JSON with "explanation" (brief text) and "sql" (valid SQL). No markdown wrapping."""
+
+FEATURE_COLS = [
+    'INTERACTION_COUNT', 'AVG_DURATION_SEC', 'AVG_WRAP_UP_SEC',
+    'AVG_HANDLE_TIME_SEC', 'TRANSFER_COUNT', 'ESCALATION_COUNT',
+    'AVG_SENTIMENT', 'AVG_CSAT', 'AVG_NPS', 'AVG_CES',
+    'FCR_RATE', 'ACCOUNT_TYPE_RANK', 'CONTRACT_TIER_RANK'
+]
+TARGET_COL = 'IS_CHURNED'
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "single_inference" not in st.session_state:
+    st.session_state.single_inference = None
+if "single_saved" not in st.session_state:
+    st.session_state.single_saved = False
+
+def get_model_versions():
+    rows = session.sql(f"SHOW VERSIONS IN MODEL {MODEL}").collect()
+    versions = []
+    for r in rows:
+        versions.append({
+            "name": r["name"],
+            "aliases": str(r["aliases"]),
+            "metadata": r["metadata"],
+            "comment": r["comment"],
+            "is_default": r["is_default_version"],
+        })
+    return versions
+
+st.title("Customer Churn Intelligence")
+st.caption("Explore churn predictions, risk levels, and run on-the-fly inference for any customer.")
+
+col1, col2, col3 = st.columns(3)
+summary = session.sql(f"""
+    SELECT
+        COUNT(*) AS total,
+        SUM(CASE WHEN CHURN_RISK_LEVEL = 'HIGH' THEN 1 ELSE 0 END) AS high_risk,
+        SUM(CASE WHEN CHURN_RISK_LEVEL = 'MEDIUM' THEN 1 ELSE 0 END) AS med_risk,
+        SUM(CASE WHEN CHURN_RISK_LEVEL = 'LOW' THEN 1 ELSE 0 END) AS low_risk,
+        ROUND(AVG(CHURN_PROBABILITY), 3) AS avg_prob
+    FROM {PREDICTIONS_TABLE}
+""").to_pandas()
+
+col1.metric("Total Customers", int(summary["TOTAL"][0]))
+col2.metric("High Risk", int(summary["HIGH_RISK"][0]))
+col3.metric("Avg Churn Probability", f"{summary['AVG_PROB'][0]:.1%}")
+
+tab1, tab2, tab3, tab4 = st.tabs(["Chat", "Predictions Dashboard", "Live Inference", "Retrain the Churn Model"])
+
+with tab2:
+    risk_filter = st.multiselect("Filter by Risk Level", ["HIGH", "MEDIUM", "LOW"], default=["HIGH", "MEDIUM", "LOW"])
+    if risk_filter:
+        risk_list = ",".join([f"'{r}'" for r in risk_filter])
+        df_pred = session.sql(f"""
+            SELECT CUSTOMER_ID, FIRST_NAME, LAST_NAME, COMPANY_NAME, ACCOUNT_TYPE, CONTRACT_TIER,
+                   CHURN_PREDICTION, ROUND(CHURN_PROBABILITY, 4) AS CHURN_PROBABILITY, CHURN_RISK_LEVEL,
+                   AVG_SENTIMENT, AVG_CSAT, FCR_RATE, TRANSFER_COUNT, ESCALATION_COUNT
+            FROM {PREDICTIONS_TABLE}
+            WHERE CHURN_RISK_LEVEL IN ({risk_list})
+            ORDER BY CHURN_PROBABILITY DESC
+        """).to_pandas()
+        st.dataframe(df_pred, use_container_width=True, height=400)
+
+with tab3:
+    st.subheader("On-the-fly Churn Inference")
+
+    inf_mode = st.radio("Inference Mode", ["Single Customer", "All Customers (Batch)"], horizontal=True)
+
+    if inf_mode == "Single Customer":
+        st.markdown("Select a customer to run real-time churn prediction using the ML model.")
+
+        customers = session.sql(f"""
+            SELECT d.CUSTOMER_ID, d.FIRST_NAME || ' ' || d.LAST_NAME AS NAME, d.COMPANY_NAME
+            FROM {DENORM_TABLE} d
+            ORDER BY d.CUSTOMER_ID
+        """).to_pandas()
+
+        selected = st.selectbox("Select Customer", customers["CUSTOMER_ID"].tolist(),
+                                format_func=lambda x: f"{x} - {customers[customers['CUSTOMER_ID']==x]['NAME'].values[0]}")
+
+        if st.button("Run Inference", type="primary"):
+            st.session_state.single_saved = False
+            with st.spinner("Running ML model..."):
+                result = session.sql(f"""
+                    SELECT
+                        d.CUSTOMER_ID, d.FIRST_NAME, d.LAST_NAME, d.COMPANY_NAME, d.EMAIL,
+                        d.ACCOUNT_TYPE, d.CONTRACT_TIER,
+                        d.INTERACTION_COUNT, d.AVG_DURATION_SEC, d.AVG_HANDLE_TIME_SEC,
+                        d.AVG_SENTIMENT, d.AVG_CSAT, d.AVG_NPS, d.AVG_CES, d.FCR_RATE,
+                        d.TRANSFER_COUNT, d.ESCALATION_COUNT,
+                        {MODEL}!PREDICT(
+                            d.INTERACTION_COUNT, d.AVG_DURATION_SEC, d.AVG_WRAP_UP_SEC,
+                            d.AVG_HANDLE_TIME_SEC, d.TRANSFER_COUNT, d.ESCALATION_COUNT,
+                            d.AVG_SENTIMENT, COALESCE(d.AVG_CSAT,3.0), COALESCE(d.AVG_NPS,5.0), COALESCE(d.AVG_CES,3.0),
+                            d.FCR_RATE, d.ACCOUNT_TYPE_RANK, d.CONTRACT_TIER_RANK
+                        ):output_feature_0::INT AS CHURN_PREDICTION,
+                        ROUND({MODEL}!PREDICT_PROBA(
+                            d.INTERACTION_COUNT, d.AVG_DURATION_SEC, d.AVG_WRAP_UP_SEC,
+                            d.AVG_HANDLE_TIME_SEC, d.TRANSFER_COUNT, d.ESCALATION_COUNT,
+                            d.AVG_SENTIMENT, COALESCE(d.AVG_CSAT,3.0), COALESCE(d.AVG_NPS,5.0), COALESCE(d.AVG_CES,3.0),
+                            d.FCR_RATE, d.ACCOUNT_TYPE_RANK, d.CONTRACT_TIER_RANK
+                        ):output_feature_1::FLOAT, 4) AS CHURN_PROBABILITY
+                    FROM {DENORM_TABLE} d
+                    WHERE d.CUSTOMER_ID = '{selected}'
+                """).to_pandas()
+
+                if len(result) > 0:
+                    st.session_state.single_inference = result.iloc[0].to_dict()
+
+        inf = st.session_state.single_inference
+        if inf and inf.get("CUSTOMER_ID") == selected:
+            prob = inf["CHURN_PROBABILITY"]
+            pred = inf["CHURN_PREDICTION"]
+            risk = "HIGH" if prob >= 0.7 else ("MEDIUM" if prob >= 0.4 else "LOW")
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Prediction", "Churned" if pred == 1 else "Retained")
+            c2.metric("Probability", f"{prob:.1%}")
+            c3.metric("Risk Level", risk)
+
+            st.markdown(f"**Customer:** {inf['FIRST_NAME']} {inf['LAST_NAME']} | **Company:** {inf['COMPANY_NAME']} | **Type:** {inf['ACCOUNT_TYPE']} | **Tier:** {inf['CONTRACT_TIER']}")
+
+            cached = session.sql(f"SELECT CHURN_PROBABILITY FROM {PREDICTIONS_TABLE} WHERE CUSTOMER_ID = '{selected}'").to_pandas()
+            record_exists = len(cached) > 0
+
+            if record_exists:
+                st.info(f"Cached prediction: {cached['CHURN_PROBABILITY'][0]:.1%} | Live prediction: {prob:.1%}")
+            else:
+                st.warning("This customer has no saved prediction yet.")
+
+            st.divider()
+
+            if st.session_state.single_saved:
+                st.success("Prediction saved successfully to CUSTOMER_CHURN_PREDICTIONS!")
+            else:
+                btn_label = "Update Existing Prediction" if record_exists else "Save as New Prediction"
+                if st.button(btn_label, type="secondary"):
+                    with st.spinner("Saving prediction..."):
+                        def safe_val(v):
+                            if v is None or (isinstance(v, float) and str(v) == 'nan'):
+                                return 'NULL'
+                            return str(v)
+                        def safe_str(v):
+                            if v is None or (isinstance(v, float) and str(v) == 'nan'):
+                                return ''
+                            return str(v).replace("'", "''")
+                        merge_sql = f"""
+                            MERGE INTO {PREDICTIONS_TABLE} AS target
+                            USING (
+                                SELECT
+                                    '{safe_str(inf["CUSTOMER_ID"])}' AS CUSTOMER_ID,
+                                    '{safe_str(inf["FIRST_NAME"])}' AS FIRST_NAME,
+                                    '{safe_str(inf["LAST_NAME"])}' AS LAST_NAME,
+                                    '{safe_str(inf.get("COMPANY_NAME",""))}' AS COMPANY_NAME,
+                                    '{safe_str(inf.get("EMAIL",""))}' AS EMAIL,
+                                    '{safe_str(inf["ACCOUNT_TYPE"])}' AS ACCOUNT_TYPE,
+                                    '{safe_str(inf["CONTRACT_TIER"])}' AS CONTRACT_TIER,
+                                    {safe_val(inf["INTERACTION_COUNT"])} AS INTERACTION_COUNT,
+                                    {safe_val(inf["AVG_DURATION_SEC"])} AS AVG_DURATION_SEC,
+                                    {safe_val(inf["AVG_HANDLE_TIME_SEC"])} AS AVG_HANDLE_TIME_SEC,
+                                    {safe_val(inf["AVG_SENTIMENT"])} AS AVG_SENTIMENT,
+                                    {safe_val(inf["AVG_CSAT"])} AS AVG_CSAT,
+                                    {safe_val(inf["AVG_NPS"])} AS AVG_NPS,
+                                    {safe_val(inf["AVG_CES"])} AS AVG_CES,
+                                    {safe_val(inf["FCR_RATE"])} AS FCR_RATE,
+                                    {safe_val(inf["TRANSFER_COUNT"])} AS TRANSFER_COUNT,
+                                    {safe_val(inf["ESCALATION_COUNT"])} AS ESCALATION_COUNT,
+                                    {pred} AS CHURN_PREDICTION,
+                                    {prob} AS CHURN_PROBABILITY,
+                                    '{risk}' AS CHURN_RISK_LEVEL,
+                                    CURRENT_TIMESTAMP() AS INFERENCE_TIMESTAMP
+                            ) AS source
+                            ON target.CUSTOMER_ID = source.CUSTOMER_ID
+                            WHEN MATCHED THEN UPDATE SET
+                                target.FIRST_NAME = source.FIRST_NAME, target.LAST_NAME = source.LAST_NAME,
+                                target.COMPANY_NAME = source.COMPANY_NAME, target.EMAIL = source.EMAIL,
+                                target.ACCOUNT_TYPE = source.ACCOUNT_TYPE, target.CONTRACT_TIER = source.CONTRACT_TIER,
+                                target.INTERACTION_COUNT = source.INTERACTION_COUNT,
+                                target.AVG_DURATION_SEC = source.AVG_DURATION_SEC,
+                                target.AVG_HANDLE_TIME_SEC = source.AVG_HANDLE_TIME_SEC,
+                                target.AVG_SENTIMENT = source.AVG_SENTIMENT, target.AVG_CSAT = source.AVG_CSAT,
+                                target.AVG_NPS = source.AVG_NPS, target.AVG_CES = source.AVG_CES,
+                                target.FCR_RATE = source.FCR_RATE, target.TRANSFER_COUNT = source.TRANSFER_COUNT,
+                                target.ESCALATION_COUNT = source.ESCALATION_COUNT,
+                                target.CHURN_PREDICTION = source.CHURN_PREDICTION,
+                                target.CHURN_PROBABILITY = source.CHURN_PROBABILITY,
+                                target.CHURN_RISK_LEVEL = source.CHURN_RISK_LEVEL,
+                                target.INFERENCE_TIMESTAMP = source.INFERENCE_TIMESTAMP
+                            WHEN NOT MATCHED THEN INSERT (
+                                CUSTOMER_ID, FIRST_NAME, LAST_NAME, COMPANY_NAME, EMAIL,
+                                ACCOUNT_TYPE, CONTRACT_TIER, INTERACTION_COUNT, AVG_DURATION_SEC,
+                                AVG_HANDLE_TIME_SEC, AVG_SENTIMENT, AVG_CSAT, AVG_NPS, AVG_CES,
+                                FCR_RATE, TRANSFER_COUNT, ESCALATION_COUNT,
+                                CHURN_PREDICTION, CHURN_PROBABILITY, CHURN_RISK_LEVEL, INFERENCE_TIMESTAMP
+                            ) VALUES (
+                                source.CUSTOMER_ID, source.FIRST_NAME, source.LAST_NAME, source.COMPANY_NAME, source.EMAIL,
+                                source.ACCOUNT_TYPE, source.CONTRACT_TIER, source.INTERACTION_COUNT, source.AVG_DURATION_SEC,
+                                source.AVG_HANDLE_TIME_SEC, source.AVG_SENTIMENT, source.AVG_CSAT, source.AVG_NPS, source.AVG_CES,
+                                source.FCR_RATE, source.TRANSFER_COUNT, source.ESCALATION_COUNT,
+                                source.CHURN_PREDICTION, source.CHURN_PROBABILITY, source.CHURN_RISK_LEVEL, source.INFERENCE_TIMESTAMP
+                            )
+                        """
+                        session.sql(merge_sql).collect()
+                        st.session_state.single_saved = True
+                        st.success(f"Prediction {'updated' if record_exists else 'inserted'} for {selected}!")
+                        st.rerun()
+
+    else:
+        st.markdown("Run the ML model on **all customers** and save the latest predictions.")
+
+        total_customers = session.sql(f"SELECT COUNT(*) AS cnt FROM {DENORM_TABLE}").to_pandas()["CNT"][0]
+        existing_preds = session.sql(f"SELECT COUNT(*) AS cnt FROM {PREDICTIONS_TABLE}").to_pandas()["CNT"][0]
+
+        c1, c2 = st.columns(2)
+        c1.metric("Customers in Denormalized Table", int(total_customers))
+        c2.metric("Existing Predictions", int(existing_preds))
+
+        st.info("This will run inference for all customers and MERGE into CUSTOMER_CHURN_PREDICTIONS.")
+
+        if st.button("Run Batch Inference & Save All", type="primary", use_container_width=True):
+            with st.spinner("Running ML inference on all customers..."):
+                merge_sql = f"""
+                    MERGE INTO {PREDICTIONS_TABLE} AS target
+                    USING (
+                        SELECT d.CUSTOMER_ID, d.FIRST_NAME, d.LAST_NAME, d.COMPANY_NAME, d.EMAIL,
+                            d.ACCOUNT_TYPE, d.CONTRACT_TIER, d.INTERACTION_COUNT, d.AVG_DURATION_SEC,
+                            d.AVG_HANDLE_TIME_SEC, d.AVG_SENTIMENT, d.AVG_CSAT, d.AVG_NPS, d.AVG_CES,
+                            d.FCR_RATE, d.TRANSFER_COUNT, d.ESCALATION_COUNT,
+                            {MODEL}!PREDICT(
+                                d.INTERACTION_COUNT, d.AVG_DURATION_SEC, d.AVG_WRAP_UP_SEC,
+                                d.AVG_HANDLE_TIME_SEC, d.TRANSFER_COUNT, d.ESCALATION_COUNT,
+                                d.AVG_SENTIMENT, COALESCE(d.AVG_CSAT,3.0), COALESCE(d.AVG_NPS,5.0), COALESCE(d.AVG_CES,3.0),
+                                d.FCR_RATE, d.ACCOUNT_TYPE_RANK, d.CONTRACT_TIER_RANK
+                            ):output_feature_0::INT AS CHURN_PREDICTION,
+                            ROUND({MODEL}!PREDICT_PROBA(
+                                d.INTERACTION_COUNT, d.AVG_DURATION_SEC, d.AVG_WRAP_UP_SEC,
+                                d.AVG_HANDLE_TIME_SEC, d.TRANSFER_COUNT, d.ESCALATION_COUNT,
+                                d.AVG_SENTIMENT, COALESCE(d.AVG_CSAT,3.0), COALESCE(d.AVG_NPS,5.0), COALESCE(d.AVG_CES,3.0),
+                                d.FCR_RATE, d.ACCOUNT_TYPE_RANK, d.CONTRACT_TIER_RANK
+                            ):output_feature_1::FLOAT, 4) AS CHURN_PROBABILITY,
+                            CASE
+                                WHEN ROUND({MODEL}!PREDICT_PROBA(
+                                    d.INTERACTION_COUNT, d.AVG_DURATION_SEC, d.AVG_WRAP_UP_SEC,
+                                    d.AVG_HANDLE_TIME_SEC, d.TRANSFER_COUNT, d.ESCALATION_COUNT,
+                                    d.AVG_SENTIMENT, COALESCE(d.AVG_CSAT,3.0), COALESCE(d.AVG_NPS,5.0), COALESCE(d.AVG_CES,3.0),
+                                    d.FCR_RATE, d.ACCOUNT_TYPE_RANK, d.CONTRACT_TIER_RANK
+                                ):output_feature_1::FLOAT, 4) >= 0.7 THEN 'HIGH'
+                                WHEN ROUND({MODEL}!PREDICT_PROBA(
+                                    d.INTERACTION_COUNT, d.AVG_DURATION_SEC, d.AVG_WRAP_UP_SEC,
+                                    d.AVG_HANDLE_TIME_SEC, d.TRANSFER_COUNT, d.ESCALATION_COUNT,
+                                    d.AVG_SENTIMENT, COALESCE(d.AVG_CSAT,3.0), COALESCE(d.AVG_NPS,5.0), COALESCE(d.AVG_CES,3.0),
+                                    d.FCR_RATE, d.ACCOUNT_TYPE_RANK, d.CONTRACT_TIER_RANK
+                                ):output_feature_1::FLOAT, 4) >= 0.4 THEN 'MEDIUM'
+                                ELSE 'LOW'
+                            END AS CHURN_RISK_LEVEL,
+                            CURRENT_TIMESTAMP() AS INFERENCE_TIMESTAMP
+                        FROM {DENORM_TABLE} d
+                    ) AS source
+                    ON target.CUSTOMER_ID = source.CUSTOMER_ID
+                    WHEN MATCHED THEN UPDATE SET
+                        target.FIRST_NAME=source.FIRST_NAME, target.LAST_NAME=source.LAST_NAME,
+                        target.COMPANY_NAME=source.COMPANY_NAME, target.EMAIL=source.EMAIL,
+                        target.ACCOUNT_TYPE=source.ACCOUNT_TYPE, target.CONTRACT_TIER=source.CONTRACT_TIER,
+                        target.INTERACTION_COUNT=source.INTERACTION_COUNT, target.AVG_DURATION_SEC=source.AVG_DURATION_SEC,
+                        target.AVG_HANDLE_TIME_SEC=source.AVG_HANDLE_TIME_SEC, target.AVG_SENTIMENT=source.AVG_SENTIMENT,
+                        target.AVG_CSAT=source.AVG_CSAT, target.AVG_NPS=source.AVG_NPS, target.AVG_CES=source.AVG_CES,
+                        target.FCR_RATE=source.FCR_RATE, target.TRANSFER_COUNT=source.TRANSFER_COUNT,
+                        target.ESCALATION_COUNT=source.ESCALATION_COUNT, target.CHURN_PREDICTION=source.CHURN_PREDICTION,
+                        target.CHURN_PROBABILITY=source.CHURN_PROBABILITY, target.CHURN_RISK_LEVEL=source.CHURN_RISK_LEVEL,
+                        target.INFERENCE_TIMESTAMP=source.INFERENCE_TIMESTAMP
+                    WHEN NOT MATCHED THEN INSERT (
+                        CUSTOMER_ID,FIRST_NAME,LAST_NAME,COMPANY_NAME,EMAIL,ACCOUNT_TYPE,CONTRACT_TIER,
+                        INTERACTION_COUNT,AVG_DURATION_SEC,AVG_HANDLE_TIME_SEC,AVG_SENTIMENT,AVG_CSAT,AVG_NPS,AVG_CES,
+                        FCR_RATE,TRANSFER_COUNT,ESCALATION_COUNT,CHURN_PREDICTION,CHURN_PROBABILITY,CHURN_RISK_LEVEL,INFERENCE_TIMESTAMP
+                    ) VALUES (
+                        source.CUSTOMER_ID,source.FIRST_NAME,source.LAST_NAME,source.COMPANY_NAME,source.EMAIL,
+                        source.ACCOUNT_TYPE,source.CONTRACT_TIER,source.INTERACTION_COUNT,source.AVG_DURATION_SEC,
+                        source.AVG_HANDLE_TIME_SEC,source.AVG_SENTIMENT,source.AVG_CSAT,source.AVG_NPS,source.AVG_CES,
+                        source.FCR_RATE,source.TRANSFER_COUNT,source.ESCALATION_COUNT,
+                        source.CHURN_PREDICTION,source.CHURN_PROBABILITY,source.CHURN_RISK_LEVEL,source.INFERENCE_TIMESTAMP
+                    )
+                """
+                session.sql(merge_sql).collect()
+                st.success("Batch inference complete! All predictions saved.")
+                st.rerun()
+
+with tab4:
+    st.subheader("Retrain the Churn Model")
+    st.markdown("Retrain the XGBoost churn classifier using the latest training data and register a new version.")
+
+    versions = get_model_versions()
+    version_names = [v["name"] for v in versions]
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Model", "CUSTOMER_CHURN_MODEL")
+    m2.metric("Available Versions", len(version_names))
+
+    training_count = session.sql(f"SELECT COUNT(*) AS cnt FROM {TRAINING_TABLE}").to_pandas()["CNT"][0]
+    m3.metric("Training Samples", int(training_count))
+
+    st.markdown("---")
+
+    st.markdown("**Current Model Versions:**")
+    for v in versions:
+        is_default = "DEFAULT" in v["aliases"]
+        try:
+            meta = json.loads(v["metadata"]) if isinstance(v["metadata"], str) else v["metadata"]
+            metrics = meta.get("metrics", {})
+            acc = metrics.get("accuracy", "N/A")
+            f1 = metrics.get("f1_score", "N/A")
+            auc = metrics.get("roc_auc", "N/A")
+            if isinstance(acc, float):
+                metrics_str = f"Accuracy={acc:.4f}, F1={f1:.4f}, AUC={auc:.4f}"
+            else:
+                metrics_str = "N/A"
+        except:
+            metrics_str = "N/A"
+        badge = " (DEFAULT)" if is_default else ""
+        st.markdown(f"- **{v['name']}{badge}** | {metrics_str}")
+
+    st.markdown("---")
+
+    default_ver = next((v["name"] for v in versions if "DEFAULT" in v["aliases"]), version_names[0])
+    selected_version = st.selectbox("Base Version (for reference)", version_names,
+                                     index=version_names.index(default_ver),
+                                     format_func=lambda x: f"{x} (default)" if x == default_ver else x)
+
+    st.markdown("**Hyperparameters:**")
+    hp1, hp2, hp3, hp4 = st.columns(4)
+    n_estimators = hp1.number_input("n_estimators", min_value=50, max_value=1000, value=200, step=50)
+    max_depth = hp2.number_input("max_depth", min_value=2, max_value=15, value=5, step=1)
+    learning_rate = hp3.number_input("learning_rate", min_value=0.01, max_value=1.0, value=0.1, step=0.01, format="%.2f")
+    test_size = hp4.number_input("test_size", min_value=0.1, max_value=0.5, value=0.2, step=0.05, format="%.2f")
+
+    next_version_num = len(version_names) + 1
+    new_version = st.text_input("New Version Name", value=f"V{next_version_num}")
+
+    set_default = st.checkbox("Set as default version after training", value=True)
+
+    st.markdown("---")
+
+    if st.button("Retrain & Register New Version", type="primary", use_container_width=True):
+        import pandas as pd
+        import numpy as np
+        from sklearn.model_selection import train_test_split
+        from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+        from xgboost import XGBClassifier
+        from snowflake.ml.registry import Registry
+
+        with st.spinner("Loading training data..."):
+            df = session.table(TRAINING_TABLE).to_pandas()
+            X = df[FEATURE_COLS].copy()
+            y = df[TARGET_COL].copy()
+            X = X.fillna(X.median())
+
+        st.info(f"Training data: {len(X)} samples, {len(FEATURE_COLS)} features, churn rate: {y.mean():.1%}")
+
+        with st.spinner(f"Training XGBoost (n_estimators={n_estimators}, max_depth={max_depth}, lr={learning_rate})..."):
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42, stratify=y)
+
+            xgb_model = XGBClassifier(
+                n_estimators=int(n_estimators),
+                max_depth=int(max_depth),
+                learning_rate=float(learning_rate),
+                subsample=0.8,
+                colsample_bytree=0.8,
+                random_state=42,
+                eval_metric='logloss',
+                use_label_encoder=False
+            )
+            xgb_model.fit(X_train, y_train)
+
+            y_pred = xgb_model.predict(X_test)
+            y_proba = xgb_model.predict_proba(X_test)[:, 1]
+            acc = accuracy_score(y_test, y_pred)
+            f1 = f1_score(y_test, y_pred)
+            auc = roc_auc_score(y_test, y_proba)
+
+        rc1, rc2, rc3 = st.columns(3)
+        rc1.metric("Accuracy", f"{acc:.4f}")
+        rc2.metric("F1 Score", f"{f1:.4f}")
+        rc3.metric("ROC AUC", f"{auc:.4f}")
+
+        with st.spinner(f"Registering model as {new_version}..."):
+            session.sql('USE DATABASE NICE_CALLCENTER_DB').collect()
+            session.sql('USE SCHEMA FEATURE_STORE').collect()
+
+            registry = Registry(session=session, database_name='NICE_CALLCENTER_DB', schema_name='FEATURE_STORE')
+
+            model_version = registry.log_model(
+                model=xgb_model,
+                model_name='CUSTOMER_CHURN_MODEL',
+                version_name=new_version,
+                sample_input_data=X_train.head(10),
+                target_platforms=['WAREHOUSE'],
+                conda_dependencies=['xgboost', 'scikit-learn'],
+                metrics={
+                    'accuracy': float(acc),
+                    'f1_score': float(f1),
+                    'roc_auc': float(auc)
+                },
+                comment=f'Retrained XGBoost. n_est={n_estimators}, depth={max_depth}, lr={learning_rate}'
+            )
+
+        if set_default:
+            with st.spinner("Setting as default version..."):
+                m = registry.get_model('CUSTOMER_CHURN_MODEL')
+                m.default = new_version
+
+        st.success(f"Model version **{new_version}** registered successfully!{' Set as default.' if set_default else ''}")
+        st.balloons()
+
+with tab1:
+    with st.sidebar:
+        st.header("Quick Questions")
+        suggestions = [
+            "Show all high-risk customers",
+            "Which customer has the highest churn probability?",
+            "Compare churn risk by account type",
+            "List customers with escalations and high churn risk",
+            "What is the average churn probability by contract tier?",
+        ]
+        for s in suggestions:
+            if st.button(s, key=f"sug_{s}", use_container_width=True):
+                st.session_state.active_prompt = s
+                st.rerun()
+        st.divider()
+        if st.button("Clear Chat", use_container_width=True):
+            st.session_state.messages = []
+            st.session_state.pop("active_prompt", None)
+            st.rerun()
+
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            if "content" in msg:
+                st.markdown(msg["content"])
+            if "sql" in msg:
+                with st.expander("View SQL"):
+                    st.code(msg["sql"], language="sql")
+            if "results" in msg:
+                st.dataframe(msg["results"], use_container_width=True)
+
+    def ask_churn_analyst(prompt):
+        escaped = prompt.replace("\\", "\\\\").replace("'", "\\'")
+        sys_escaped = SYSTEM_PROMPT.replace("\\", "\\\\").replace("'", "\\'")
+        sql = f"""
+        SELECT SNOWFLAKE.CORTEX.COMPLETE(
+            'mistral-large2',
+            ARRAY_CONSTRUCT(
+                OBJECT_CONSTRUCT('role', 'system', 'content', '{sys_escaped}'),
+                OBJECT_CONSTRUCT('role', 'user', 'content', '{escaped}')
+            ),
+            OBJECT_CONSTRUCT('temperature', 0.1, 'max_tokens', 2000)
+        ) AS result
+        """
+        raw = session.sql(sql).collect()[0]["RESULT"]
+        parsed = json.loads(raw)
+        content = parsed.get("choices", [{}])[0].get("messages", "")
+        if not content:
+            content = parsed.get("choices", [{}])[0].get("message", {}).get("content", str(parsed))
+        content = content.strip()
+        if content.startswith("```"):
+            content = re.sub(r"^```(?:json)?\s*", "", content)
+            content = re.sub(r"\s*```$", "", content)
+        try:
+            data = json.loads(content)
+        except:
+            data = {"explanation": content, "sql": ""}
+        return data
+
+    def process_message(prompt):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        with st.chat_message("assistant"):
+            with st.spinner("Analyzing..."):
+                try:
+                    result = ask_churn_analyst(prompt)
+                    explanation = result.get("explanation", "")
+                    sql_query = result.get("sql", "")
+                    assistant_msg = {"role": "assistant"}
+                    if explanation:
+                        st.markdown(explanation)
+                        assistant_msg["content"] = explanation
+                    if sql_query:
+                        with st.expander("View SQL"):
+                            st.code(sql_query, language="sql")
+                        assistant_msg["sql"] = sql_query
+                        df = session.sql(sql_query).to_pandas()
+                        st.dataframe(df, use_container_width=True)
+                        assistant_msg["results"] = df
+                    st.session_state.messages.append(assistant_msg)
+                except Exception as e:
+                    err = f"Error: {str(e)}"
+                    st.error(err)
+                    st.session_state.messages.append({"role": "assistant", "content": err})
+
+    active_prompt = st.session_state.pop("active_prompt", None)
+    if active_prompt:
+        process_message(active_prompt)
+
+    if user_input := st.chat_input("Ask about customer churn..."):
+        process_message(user_input)
