@@ -1,0 +1,129 @@
+PROMPTS FOR SIMULATING ENTERPRISE AI READINESS – NICE LTD.
+
+  ------------------------------------------------------------
+  PROMPT 1 — Create Enterprise Context + Data Domains
+  ------------------------------------------------------------
+  You are a Senior Enterprise Data Architect.
+
+  Create a fictional but realistic enterprise data landscape
+  for the company NICE Ltd., a global CX, analytics,
+  compliance, and AI platform company.
+
+  Define business domains: 1. Customer Interaction Platform 2.
+  Contact Center Operations 3. Sales & CRM 4. Workforce
+  Management 5. Compliance & Risk Monitoring 6. Cloud Platform
+  Telemetry 7. Billing & Subscription Systems
+
+  Requirements: - Each domain owned by different business
+  teams. - Systems NOT integrated. - Different technologies
+  per domain: - SQL Server - Snowflake - PostgreSQL - CSV Data
+  Lake - SaaS exports - Streaming logs
+
+  Output: - System landscape diagram (textual) - Data
+  ownership map - Technology stack per domain
+  ------------------------------------------------------------
+
+PROMPT 2 — Create Fragmented Databases
+
+Create separate databases:
+
+NICE_CRM_DB NICE_CONTACT_CENTER_DB NICE_WFM_DB NICE_COMPLIANCE_DB
+NICE_TELEMETRY_DB NICE_BILLING_DB
+
+Rules: - No shared primary keys - Different naming conventions -
+Different timestamp formats - Duplicate customer representations
+
+Generate SQL DDL statements.
+
+  ------------------------------------------------------------
+  PROMPT 3 — Generate Poor Quality Schemas
+  ------------------------------------------------------------
+  Create schemas with enterprise data problems:
+
+  - inconsistent column naming - mixed casing - redundant
+  attributes - missing foreign keys - no referential
+  integrity - untyped JSON columns - duplicated tables -
+  ambiguous IDs
+
+  Example: customerId vs cust_id vs client_identifier
+
+  Generate CREATE TABLE statements.
+  ------------------------------------------------------------
+
+PROMPT 4 — Populate Raw Messy Data
+
+Insert realistic enterprise data.
+
+Simulate: - 25% NULL values - inconsistent country formats - corrupted
+timestamps - duplicated customers - orphan transactions - partial
+records - conflicting values
+
+Create: - 1M interaction records - 200K customers - 500K billing
+events - streaming telemetry logs
+
+  ------------------------------------------------------------
+  PROMPT 5 — Inject Advanced Enterprise Problems
+  ------------------------------------------------------------
+  Degrade data quality further:
+
+  - schema drift - changing column meanings - renamed fields
+  across months - missing metadata - unknown lineage -
+  undocumented tables - untagged PII fields - conflicting
+  business definitions
+
+  Output: Data Quality Assessment Report.
+  ------------------------------------------------------------
+
+PROMPT 6 — Create Missing Metadata Scenario
+
+Simulate metadata crisis.
+
+Remove or omit: - catalog entries - column descriptions - data owners -
+lineage tracking - semantic definitions
+
+Create metadata_inventory table showing incomplete governance.
+
+Goal: Enterprise NOT AI-ready.
+
+  ------------------------------------------------------------
+  PROMPT 7 — Load External Skills Context
+  ------------------------------------------------------------
+  Load the file skills.md.
+
+ 
+  ------------------------------------------------------------
+
+PROMPT 8 — Apply Skills to Create Unified AI Schema
+
+Using ONLY skills.md:
+
+Create NICE_AI_FOUNDATION schema.
+
+Requirements: - canonical customer entity - standardized timestamps -
+governed identifiers - semantic business layer - domain federation -
+feature-ready datasets
+
+Generate transformation SQL and pipelines.
+
+  ------------------------------------------------------------
+  PROMPT 9 — Build AI-Ready Feature Store
+  ------------------------------------------------------------
+  Using skills.md:
+
+  Create AI Feature Store including: - customer behavior
+  features - churn signals - interaction sentiment metrics -
+  compliance risk features - workforce efficiency indicators
+
+  Include: - feature versioning - lineage tracking -
+  explainability metadata - training vs inference consistency
+  ------------------------------------------------------------
+
+PROMPT 10 — Validate AI Readiness
+
+Perform AI readiness validation.
+
+Evaluate: - data quality score - governance maturity -
+interoperability - semantic consistency - model readiness - real-time
+usability
+
+Output: Enterprise AI Readiness Report (Before vs After).
